@@ -1,0 +1,294 @@
+---
+doc_id: transformers_notes
+title: Transformers Notes
+version: 1.0.0
+updated: 2026-10-23
+language: en
+domain: machine-learning
+subdomain: transformer-architecture
+audience: students, ML engineers
+doc_type: study-notes
+summary: Study notes on the Transformer architecture, model families, training, inference, efficiency, multimodal use, and RAG.
+sections: 18
+tags: [alibi, architecture, attention-is-all-you-need, bert, bpe, causal-mask, chunking, clip, complexity, cross-attention, decoder, decoder-only, definitions, dpo, embeddings, encoder, encoder-decoder, encoder-only, faq, ffn, flashattention, gelu, glossary, gpt, gqa, hallucination, history, hybrid-search, inference, interpretability, kv-cache, layernorm, limitations, long-context, lora, mamba, mixture-of-experts, mla, moe, mqa, multi-head-attention, multimodal, overview, papers, positional-encoding, pre-ln, pretraining, qa, qkv, quantization, quick-reference, rag, reading-list, references, reranking, residual, retrieval, rlhf, rmsnorm, rope, safety, sampling, scaling-laws, self-attention, sentencepiece, sft, sinusoidal, softmax, sparse-attention, swiglu, t5, temperature, tokenization, top-p, vit, whisper, wordpiece]
+---
+
+# Transformers Notes
+
+Study notes on the Transformer architecture and the models built on it. Each section is self-contained (it names its subject explicitly) so it can be retrieved on its own as a chunk in a RAG pipeline.
+
+---
+
+## 1. Overview
+
+The Transformer is a neural network architecture introduced in the 2017 paper "Attention Is All You Need" (Vaswani et al.). It was designed for sequence-to-sequence tasks such as machine translation. Unlike recurrent neural networks (RNNs) and LSTMs, the Transformer processes all tokens of a sequence in parallel and relies entirely on a mechanism called self-attention to model relationships between tokens.
+
+Key advantages of the Transformer over RNNs:
+
+- **Parallelism:** all positions are processed at once, so training uses GPUs/TPUs efficiently.
+- **Long-range dependencies:** any token can attend directly to any other token, so the path length between distant tokens is constant rather than growing with distance.
+- **Scalability:** performance improves predictably as model size, data, and compute grow (scaling laws).
+
+Today, Transformers are the foundation of large language models (LLMs), vision models (ViT), speech models (Whisper), multimodal models, and protein models.
+
+---
+
+## 2. Tokenization and Embeddings
+
+Transformers operate on numbers, not text. Text is first split into **tokens**, which are mapped to integer IDs.
+
+**Common tokenization methods:**
+
+- **Byte-Pair Encoding (BPE):** starts from characters (or bytes) and iteratively merges the most frequent adjacent pairs. Used by GPT models.
+- **WordPiece:** similar to BPE but merges based on likelihood; used by BERT.
+- **SentencePiece / Unigram:** language-agnostic, works on raw text without pre-splitting on whitespace; used by T5 and LLaMA-style models.
+
+Each token ID indexes into an **embedding matrix** of shape `(vocab_size, d_model)`, producing a dense vector per token. `d_model` is the model's hidden dimension (512 in the original Transformer, 768 in BERT-base, 4096+ in large LLMs).
+
+---
+
+## 3. Positional Encoding
+
+Self-attention is permutation-invariant: without extra information it cannot tell token order. Positional information is therefore injected.
+
+- **Sinusoidal positional encoding (original):** fixed sine and cosine functions of different frequencies are added to the embeddings. Allows some extrapolation to unseen lengths.
+- **Learned positional embeddings:** a trainable vector per position (used in BERT, GPT-2). Limited to the maximum training length.
+- **Relative position methods:** encode distance between tokens rather than absolute position (T5 relative bias, ALiBi).
+- **Rotary Position Embedding (RoPE):** rotates query and key vectors by an angle proportional to position, so attention scores depend on relative position. Used in LLaMA, Mistral, Qwen, and many modern LLMs. Context extension techniques (position interpolation, YaRN) build on RoPE.
+
+---
+
+## 4. Self-Attention
+
+Self-attention lets each token build a new representation as a weighted combination of all tokens in the sequence.
+
+For an input matrix `X`, three learned linear projections produce:
+
+- **Queries (Q)** = X·W_Q: what each token is looking for.
+- **Keys (K)** = X·W_K: what each token offers.
+- **Values (V)** = X·W_V: the information each token carries.
+
+**Scaled dot-product attention:**
+
+```
+Attention(Q, K, V) = softmax( Q·Kᵀ / √d_k ) · V
+```
+
+Steps:
+
+1. Compute similarity scores between every query and every key (`Q·Kᵀ`).
+2. Divide by `√d_k` to keep the variance stable; without scaling, large dot products push softmax into regions with tiny gradients.
+3. Apply softmax so each row sums to 1 (attention weights).
+4. Use the weights to take a weighted sum of the value vectors.
+
+**Complexity:** time and memory are O(n² · d) for sequence length n, which is the main bottleneck for long contexts.
+
+**Causal (masked) attention:** in decoder models, a mask sets scores for future positions to negative infinity before softmax, so token *i* can only attend to tokens ≤ *i*. This enforces autoregressive generation.
+
+---
+
+## 5. Multi-Head Attention
+
+Instead of one attention operation, the model runs `h` attention operations ("heads") in parallel, each with its own Q, K, V projections of dimension `d_k = d_model / h`. Outputs are concatenated and passed through an output projection `W_O`.
+
+Why it helps: different heads can specialize in different relationships, such as syntactic dependencies, coreference, or positional neighbors. Heads operate in lower-dimensional subspaces, so total compute is similar to single-head attention at full dimension.
+
+**Variants for efficient inference:**
+
+- **Multi-Query Attention (MQA):** all heads share a single K and V projection; shrinks the KV cache dramatically.
+- **Grouped-Query Attention (GQA):** heads are split into groups that share K/V; a middle ground between quality and memory (used in LLaMA 2/3 70B, Mistral).
+- **Multi-head Latent Attention (MLA):** compresses K/V into a low-rank latent to cut cache size (used in DeepSeek models).
+
+---
+
+## 6. Feed-Forward Network (FFN)
+
+Each Transformer layer contains a position-wise feed-forward network applied independently to every token:
+
+```
+FFN(x) = W2 · activation(W1 · x + b1) + b2
+```
+
+The hidden dimension is typically 4× `d_model`. The original model used ReLU; later models use GELU, or gated variants such as **SwiGLU** (used in LLaMA, PaLM), which add a gating branch and generally improve quality.
+
+The FFN holds a large fraction of the model's parameters and is often interpreted as storing factual knowledge, while attention routes information between tokens.
+
+**Mixture of Experts (MoE):** the FFN is replaced by many expert FFNs, and a router sends each token to the top-k experts (commonly k = 1 or 2, or more in fine-grained designs). This raises total parameter count while keeping per-token compute roughly constant. Examples: Mixtral, Switch Transformer, DeepSeek-V3.
+
+---
+
+## 7. Residual Connections and Normalization
+
+Every sub-layer (attention, FFN) is wrapped with a residual connection: `output = x + Sublayer(x)`. Residuals let gradients flow through deep stacks and make training of very deep models possible.
+
+**Layer Normalization** stabilizes activations.
+
+- **Post-LN (original):** normalize after the residual addition. Harder to train at depth, needs learning-rate warmup.
+- **Pre-LN:** normalize before each sub-layer. More stable and now standard.
+- **RMSNorm:** a simpler normalization that skips mean-centering; used in LLaMA and most modern LLMs.
+
+---
+
+## 8. The Original Encoder-Decoder Architecture
+
+The 2017 Transformer has two stacks:
+
+- **Encoder:** N identical layers (6 in the paper), each with multi-head self-attention followed by an FFN. Reads the full source sequence bidirectionally.
+- **Decoder:** N identical layers, each with (1) masked self-attention, (2) **cross-attention** where queries come from the decoder and keys/values come from the encoder output, and (3) an FFN.
+
+A final linear layer plus softmax converts decoder outputs to a probability distribution over the vocabulary.
+
+---
+
+## 9. Three Families of Transformer Models
+
+### 9.1 Encoder-only (e.g., BERT, RoBERTa, DeBERTa)
+- Bidirectional attention; every token sees the whole input.
+- Pretrained with **masked language modeling (MLM)**: randomly mask tokens and predict them.
+- Best for understanding tasks: classification, named entity recognition, extractive QA, and **text embeddings** (the basis of many retrieval models).
+
+### 9.2 Decoder-only (e.g., GPT series, LLaMA, Mistral, Claude-style LLMs)
+- Causal attention; each token sees only previous tokens.
+- Pretrained with **next-token prediction** (causal language modeling).
+- Best for text generation, chat, code, and reasoning. This is the dominant architecture for modern LLMs.
+
+### 9.3 Encoder-decoder (e.g., T5, BART, original Transformer)
+- Encoder reads input; decoder generates output with cross-attention.
+- Natural for translation, summarization, and other input-to-output transformations. T5 frames every task as text-to-text.
+
+---
+
+## 10. Training Pipeline for LLMs
+
+1. **Pretraining:** next-token prediction on trillions of tokens of web text, books, code. This is the most expensive stage and produces a base model.
+2. **Supervised fine-tuning (SFT) / instruction tuning:** train on curated prompt-response pairs so the model follows instructions.
+3. **Preference tuning / alignment:** methods such as **RLHF** (reinforcement learning from human feedback), **DPO** (direct preference optimization), and RL from verifiable rewards, which steer the model toward helpful, harmless, and correct behavior.
+4. **Parameter-efficient fine-tuning:** **LoRA** and **QLoRA** train small low-rank adapter matrices instead of all weights, cutting memory and cost.
+
+**Scaling laws:** loss falls as a power law in parameters, data, and compute. The Chinchilla result (2022) showed many earlier models were under-trained and that parameters and training tokens should scale roughly together.
+
+---
+
+## 11. Inference and Generation
+
+**Autoregressive decoding:** the model generates one token at a time, appending each to the input.
+
+**KV cache:** keys and values from previous tokens are stored so they are not recomputed at every step. This speeds up generation but memory grows linearly with context length and batch size, which is why MQA/GQA matter.
+
+**Prefill vs. decode:** the prompt is processed in parallel (prefill, compute-bound); then tokens are generated sequentially (decode, memory-bandwidth-bound).
+
+**Sampling strategies:**
+
+- **Greedy:** always pick the most likely token.
+- **Temperature:** divides logits before softmax; lower is more deterministic, higher is more random.
+- **Top-k:** sample only from the k most likely tokens.
+- **Top-p (nucleus):** sample from the smallest set of tokens whose cumulative probability exceeds p.
+- **Beam search:** keeps multiple candidate sequences; common in translation.
+
+**Speed-ups:** quantization (INT8/INT4), speculative decoding, continuous batching, FlashAttention, paged KV cache (vLLM).
+
+---
+
+## 12. Efficient and Long-Context Attention
+
+- **FlashAttention:** an exact attention algorithm that tiles computation to minimize reads/writes between GPU high-bandwidth memory and on-chip SRAM. Same result, much faster and lower memory.
+- **Sparse / sliding-window attention:** each token attends to a local window (Longformer, Mistral) plus optional global tokens.
+- **Linear attention and state-space models:** approximations or alternatives (e.g., Mamba) that scale linearly with sequence length; often combined with attention in hybrid models.
+- **Context-extension techniques:** RoPE scaling, YaRN, and continued training on longer sequences.
+
+---
+
+## 13. Vision and Multimodal Transformers
+
+- **Vision Transformer (ViT):** splits an image into fixed-size patches (e.g., 16×16), linearly embeds each patch, adds positional embeddings, and feeds the sequence to a standard encoder.
+- **CLIP:** trains an image encoder and a text encoder jointly with a contrastive loss so matching image-text pairs have similar embeddings.
+- **Multimodal LLMs:** a vision encoder produces image tokens that are projected into the LLM's embedding space and processed together with text tokens.
+- **Speech:** Whisper uses an encoder-decoder Transformer on log-Mel spectrograms for transcription and translation.
+
+---
+
+## 14. Transformers and Retrieval-Augmented Generation (RAG)
+
+**RAG** combines a retriever with a generator so an LLM can answer using external documents instead of relying only on its parameters.
+
+**Pipeline:**
+
+1. **Ingest:** load documents and split them into chunks (commonly 200–1000 tokens, often with 10–20% overlap). Splitting along headings or semantic boundaries tends to beat fixed-size splits.
+2. **Embed:** convert each chunk to a vector using an embedding model (typically an encoder-style Transformer).
+3. **Index:** store vectors in a vector database or index (FAISS, pgvector, Qdrant, Chroma, etc.), optionally alongside a keyword index (BM25).
+4. **Retrieve:** embed the user query and fetch the top-k nearest chunks by cosine similarity. **Hybrid search** (dense + BM25) and **reranking** with a cross-encoder usually improve precision.
+5. **Generate:** place the retrieved chunks in the LLM prompt and ask the model to answer grounded in that context, ideally with citations.
+
+**Why RAG matters:** it reduces hallucination, lets knowledge be updated without retraining, and allows answers over private data.
+
+**Common failure points:** chunks too small or too large, missing context at chunk boundaries, poor query-document matching, too many irrelevant chunks diluting the prompt, and the "lost in the middle" effect where models use information at the start and end of long prompts better than the middle.
+
+---
+
+## 15. Limitations and Open Challenges
+
+- **Quadratic attention cost** makes very long contexts expensive.
+- **Hallucination:** models can produce fluent but false statements.
+- **Data and compute cost:** training frontier models requires enormous resources.
+- **Interpretability:** internal mechanisms are hard to inspect; mechanistic interpretability is an active research area.
+- **Reasoning and reliability:** models can fail on multi-step logic, arithmetic, and out-of-distribution problems, though reasoning-focused training and test-time compute have improved this.
+- **Bias and safety:** models inherit biases from training data and can be misused.
+
+---
+
+## 16. Glossary
+
+| Term | Meaning |
+|---|---|
+| Token | A unit of text (word piece, character, or byte) the model processes |
+| Embedding | A dense vector representing a token or text chunk |
+| Attention head | One parallel attention computation within multi-head attention |
+| d_model | Hidden dimension of the model |
+| Context window | Maximum number of tokens the model can process at once |
+| KV cache | Stored keys and values from earlier tokens to speed up decoding |
+| Logits | Raw, pre-softmax scores over the vocabulary |
+| Perplexity | Exponentiated average negative log-likelihood; lower is better |
+| Fine-tuning | Further training of a pretrained model on a narrower dataset |
+| LoRA | Low-rank adapters for parameter-efficient fine-tuning |
+| MoE | Mixture of Experts, with sparse activation of expert FFNs |
+| RAG | Retrieval-Augmented Generation |
+| Cross-encoder | Model that scores a query-document pair jointly, used for reranking |
+
+---
+
+## 17. Quick Reference Q&A
+
+**Q: Why divide by √d_k in attention?**
+To prevent large dot products from saturating the softmax, which would make gradients vanish.
+
+**Q: What is the difference between self-attention and cross-attention?**
+In self-attention, Q, K, and V all come from the same sequence. In cross-attention, Q comes from one sequence (the decoder) and K, V come from another (the encoder output).
+
+**Q: Why are decoder-only models dominant for LLMs?**
+They are simple, scale well, train on plain next-token prediction with abundant unlabeled text, and handle both understanding and generation through prompting.
+
+**Q: What does the KV cache store and why?**
+The key and value vectors of all previous tokens, so each new token needs only its own Q/K/V computed rather than reprocessing the full sequence.
+
+**Q: What is the difference between BERT and GPT?**
+BERT is encoder-only with bidirectional attention trained via masked language modeling; GPT is decoder-only with causal attention trained via next-token prediction.
+
+**Q: How does RoPE encode position?**
+It rotates query and key vectors by position-dependent angles so their dot product depends on relative distance.
+
+**Q: What is the main benefit of GQA?**
+It reduces KV cache memory and bandwidth by sharing keys/values among groups of query heads, with minimal quality loss.
+
+---
+
+## 18. Further Reading
+
+- Vaswani et al., "Attention Is All You Need" (2017)
+- Devlin et al., "BERT" (2018)
+- Radford et al., GPT-2 and GPT-3 papers (2019, 2020)
+- Raffel et al., "T5" (2019)
+- Dosovitskiy et al., "An Image Is Worth 16x16 Words" (ViT, 2020)
+- Hoffmann et al., "Training Compute-Optimal Large Language Models" (Chinchilla, 2022)
+- Dao et al., "FlashAttention" (2022)
+- Su et al., "RoFormer" (RoPE, 2021)
+- Lewis et al., "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks" (2020)
