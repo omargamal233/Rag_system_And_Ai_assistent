@@ -1,4 +1,4 @@
-# RAG System and AI Assistant
+# RAG System and AI Assistant Agent
 
 This repository contains two small LangChain projects:
 
